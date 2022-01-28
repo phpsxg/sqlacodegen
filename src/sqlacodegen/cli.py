@@ -1,6 +1,7 @@
 from __future__ import annotations
-
+from icecream import ic
 import argparse
+from generators import DeclarativeGenerator
 import sys
 from contextlib import ExitStack
 
@@ -14,6 +15,8 @@ else:
 
 
 def main() -> None:
+    ic(entry_points(group='sqlacodegen'))
+
     generators = {ep.name: ep for ep in entry_points(group='sqlacodegen.generators')}
     parser = argparse.ArgumentParser(
         description='Generates SQLAlchemy model code from an existing database.')
@@ -45,7 +48,8 @@ def main() -> None:
         metadata.reflect(engine, schema, not args.noviews, tables)
 
     # Instantiate the generator
-    generator_class = generators[args.generator].load()
+    # generator_class = generators[args.generator].load()
+    generator_class = DeclarativeGenerator
     generator = generator_class(metadata, engine, set(args.option or ()))
 
     # Open the target file (if given)

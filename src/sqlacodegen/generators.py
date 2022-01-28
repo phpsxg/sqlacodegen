@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import copy
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from icecream import ic
 import inspect
 import re
 import sys
@@ -16,18 +20,25 @@ from typing import Any, ClassVar, Collection, DefaultDict, Iterable, Sequence
 
 import inflect
 import sqlalchemy
+# SQLAlchemy 1.4+
+try:
+    from sqlalchemy import Identity
+except ImportError:
+    Identity = None
+
 from sqlalchemy import (
     ARRAY, Boolean, CheckConstraint, Column, Computed, Constraint, DefaultClause, Enum, Float,
-    ForeignKey, ForeignKeyConstraint, Identity, Index, MetaData, PrimaryKeyConstraint, String,
+    ForeignKey, ForeignKeyConstraint, Index, MetaData, PrimaryKeyConstraint, String,
     Table, Text, UniqueConstraint)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import CompileError
 from sqlalchemy.sql.elements import TextClause
+from clickhouse_sqlalchemy.types.common import Nullable
 
-from .models import (
+from models import (
     ColumnAttribute, JoinType, Model, ModelClass, RelationshipAttribute, RelationshipType)
-from .utils import (
+from utils import (
     get_column_names, get_common_fk_constraints, get_compiled_expression, get_constraint_sort_key,
     uses_default_name)
 
@@ -144,7 +155,12 @@ class TablesGenerator(CodeGenerator):
             self.collect_imports_for_constraint(index)
 
     def collect_imports_for_column(self, column: Column[Any]) -> None:
+        # todo
         self.add_import(Column)
+        # if column.nullable:
+        if isinstance(column.type, Nullable):
+            # 嵌套类型
+            self.add_import(column.type.nested_type)
         self.add_import(column.type)
 
         if isinstance(column.type, ARRAY):
@@ -304,8 +320,11 @@ class TablesGenerator(CodeGenerator):
                                      for i in column.table.indexes)
         is_primary = any(isinstance(c, PrimaryKeyConstraint) and column.name in c.columns
                          and uses_default_name(c) for c in column.table.constraints)
-        has_index = any(set(i.columns) == {column} for i in column.table.indexes)
 
+        if not is_primary:
+            if column.name in self.primary_keys:
+                is_primary = True
+        has_index = any(set(i.columns) == {column} for i in column.table.indexes)
         if show_name:
             args.append(repr(column.name))
 
@@ -356,9 +375,9 @@ class TablesGenerator(CodeGenerator):
 
             args.append(f'Computed({expression!r}{persist_arg})')
             self.add_import(Computed)
-        elif isinstance(column.server_default, Identity):
-            args.append(repr(column.server_default))
-            self.add_import(Identity)
+        # elif isinstance(column.server_default, Identity):
+        #     args.append(repr(column.server_default))
+        #     self.add_import(Identity)
         elif column.server_default:
             kwargs['server_default'] = repr(column.server_default)
 
@@ -392,7 +411,11 @@ class TablesGenerator(CodeGenerator):
             elif use_kwargs:
                 kwargs[param.name] = repr(value)
             else:
-                args.append(repr(value))
+                # todo
+                if hasattr(value, '__name__'):
+                    args.append(value.__name__)
+                else:
+                    args.append(repr(value))
 
         vararg = next((param.name for param in sig.parameters.values()
                        if param.kind is Parameter.VAR_POSITIONAL), None)
@@ -563,11 +586,29 @@ class DeclarativeGenerator(TablesGenerator):
 
     def __init__(self, metadata: MetaData, bind: Connection | Engine, options: Sequence[str], *,
                  indentation: str = '    ', base_class_name: str = 'Base'):
+        ic('__init__')
+
+        self.bind_name = bind.name
+        # 获取system.table
+        bind_args = bind.url.translate_connect_args()
+        host = bind_args['host']
+        port = bind_args['port']
+        username = bind_args.get('username', '')
+        password = bind_args.get('password', '')
+        database = 'system'
+        sys_url = f'clickhouse://{username}:{password}@{host}:{port}/{database}'
+        self.sys_engine = create_engine(sys_url)
+        sys_metadata = copy.deepcopy(metadata)
+        self.sys_table = Table('tables', sys_metadata, autoload=True, autoload_with=self.sys_engine)
+        DbSession = sessionmaker(bind=self.sys_engine)
+        self.sys_session = DbSession()
+
         super().__init__(metadata, bind, options, indentation=indentation)
         self.base_class_name: str = base_class_name
         self.inflect_engine = inflect.engine()
 
     def collect_imports(self, models: Iterable[Model]) -> None:
+        ic('collect_imports')
         super().collect_imports(models)
         if any(isinstance(model, ModelClass) for model in models):
             self.remove_literal_import('sqlalchemy', 'MetaData')
@@ -577,12 +618,14 @@ class DeclarativeGenerator(TablesGenerator):
                 self.add_literal_import('sqlalchemy.orm', 'declarative_base')
 
     def collect_imports_for_model(self, model: Model) -> None:
+        ic('collect_imports_for_model')
         super().collect_imports_for_model(model)
         if isinstance(model, ModelClass):
             if model.relationships:
                 self.add_literal_import('sqlalchemy.orm', 'relationship')
 
     def generate_models(self) -> list[Model]:
+        ic('generate_models')
         models_by_table_name: dict[str, Model] = {}
 
         # Pick association tables from the metadata into their own set, don't process them normally
@@ -599,9 +642,8 @@ class DeclarativeGenerator(TablesGenerator):
 
             # Only form model classes for tables that have a primary key and are not association
             # tables
-            if not table.primary_key:
-                models_by_table_name[table.name] = Model(table)
-            else:
+
+            if self.bind_name == 'clickhouse':
                 model = ModelClass(table)
                 models_by_table_name[table.name] = model
 
@@ -610,6 +652,22 @@ class DeclarativeGenerator(TablesGenerator):
                     column_attr = ColumnAttribute(model, column)
                     model.columns.append(column_attr)
 
+                if not table.primary_key:
+                    primary_key_res = self.sys_session.query(self.sys_table.c.primary_key).filter(
+                        self.sys_table.c.name == model.table.name).first()
+                    if primary_key_res:
+                        self.primary_keys = primary_key_res.primary_key.split(',')
+            else:
+                if not table.primary_key and self.bind_name != 'clickhouse':
+                    models_by_table_name[table.name] = Model(table)
+                else:
+                    model = ModelClass(table)
+                    models_by_table_name[table.name] = model
+
+                    # Fill in the columns
+                    for column in table.c:
+                        column_attr = ColumnAttribute(model, column)
+                        model.columns.append(column_attr)
         # Add relationships
         for model in models_by_table_name.values():
             if isinstance(model, ModelClass):
@@ -647,6 +705,11 @@ class DeclarativeGenerator(TablesGenerator):
 
         # Add many-to-one (and one-to-many) relationships
         pk_column_names = {col.name for col in source.table.primary_key.columns}
+        if not pk_column_names:
+            primary_key_res = self.sys_session.query(self.sys_table.c.primary_key).filter(
+                self.sys_table.c.name == source.table.name).first()
+            if primary_key_res:
+                pk_column_names = primary_key_res
         for constraint in sorted(source.table.foreign_key_constraints,
                                  key=get_constraint_sort_key):
             target = models_by_table_name[constraint.elements[0].column.table.name]
@@ -750,8 +813,9 @@ class DeclarativeGenerator(TablesGenerator):
     def generate_model_name(self, model: Model, global_names: set[str]) -> None:
         if isinstance(model, ModelClass):
             preferred_name = _re_invalid_identifier.sub('_', model.table.name)
-            preferred_name = ''.join(part[:1].upper() + part[1:]
-                                     for part in preferred_name.split('_'))
+            # todo
+            # preferred_name = ''.join(part[:1].upper() + part[1:]
+            #  for part in preferred_name.split('_'))
             if 'use_inflect' in self.options:
                 preferred_name = self.inflect_engine.singular_noun(preferred_name)
 
@@ -804,6 +868,7 @@ class DeclarativeGenerator(TablesGenerator):
         relationship.name = self.find_free_name(preferred_name, global_names, local_names)
 
     def render_module_variables(self, models: list[Model]) -> str:
+        ic('render_module_variables')
         if not any(isinstance(model, ModelClass) for model in models):
             return super().render_module_variables(models)
 
@@ -814,6 +879,7 @@ class DeclarativeGenerator(TablesGenerator):
         return '\n'.join(declarations)
 
     def render_models(self, models: list[Model]) -> str:
+        ic('render_models')
         rendered = []
         for model in models:
             if isinstance(model, ModelClass):
@@ -824,6 +890,7 @@ class DeclarativeGenerator(TablesGenerator):
         return '\n\n\n'.join(rendered)
 
     def render_class(self, model: ModelClass) -> str:
+        ic('render_class')
         sections: list[str] = []
 
         # Render class variables / special declarations
@@ -863,7 +930,7 @@ class DeclarativeGenerator(TablesGenerator):
         table_args = self.render_table_args(model.table)
         if table_args:
             variables.append(f'__table_args__ = {table_args}')
-
+        ic(variables)
         return '\n'.join(variables)
 
     def render_table_args(self, table: Table) -> str:
